@@ -1,9 +1,11 @@
-from typing import NamedTuple, TYPE_CHECKING, TypeVar, Generic, Dict, List, Any, Optional
+from __future__ import annotations
+from typing import NamedTuple, Callable, Type, TYPE_CHECKING, TypeVar, Generic, Dict, List, Any, Optional
 from typing_extensions import Literal
 from types import ModuleType
+from abc import abstractclassmethod
 import sys
 import json
-
+import importlib
 from .fname_encodings import fname_decode, fname_encode
 from pygwalker.base import BYTE_LIMIT
 
@@ -20,51 +22,96 @@ class FieldSpec(NamedTuple):
     analyticType: Literal['?', 'dimension', 'measure'] = '?'
     display_as: str = None
 
+class PandasLike(NamedTuple):
+    "Storage for 2 types, DataFrame and Series."
+    DataFrame: type
+    Series: type
 
 default_field_spec = FieldSpec()
 
-dataframe_types = []
+types: List[PandasLike] = []
 if TYPE_CHECKING:
-    try:
-        import pandas as pd
-        dataframe_types.append(pd.DataFrame)
-    except ModuleNotFoundError:
-        pass
-    try:
-        import polars as pl
-        dataframe_types.append(pl.DataFrame)
-    except ModuleNotFoundError:
-        pass
+    def _find_df_or_series(module: ModuleType, attr: Literal['DataFrame', 'Series']):
+        """
+        Finding DataFrame or Series from a module.
+        e.g. return module.DataFrame if module is pandas
+        """
+        try:
+            df_or_series = getattr(module, attr)
+            return df_or_series
+        except AttributeError:
+            raise ValueError("The given module {} doesn't contain the following class {}".format(module, attr))
+        
 
+    def _try_import_to_list(module: str):
+        """
+        Import the given module and append it to the `types` string.
+        Does nothing if the import fails.
+        """
+        try:
+            pd = importlib.import_module(module)
+        except ModuleNotFoundError:
+            return
 
-DataFrame = TypeVar("DataFrame", *dataframe_types)
+        df = _find_df_or_series(pd, 'DataFrame')
+        series = _find_df_or_series(pd, 'Series')
+
+        types.append(PandasLike(DataFrame=df, Series=series))
+            
+    _try_import_to_list('pandas')
+    _try_import_to_list('modin.pandas')
+    _try_import_to_list('polars')
+
+DataFrame = TypeVar("DataFrame", *[typ.DataFrame for typ in types])
 """
-DataFrame can be either pandas.DataFrame or polars.DataFrame
+DataFrame can be *.DataFrame, where * is a module.
+"""
+
+Series = TypeVar("Series", *[typ.Series for typ in types])
+"""
+Series can be *.Series, where * is a module.
 """
 
 
-class DataFramePropGetter(Generic[DataFrame]):
+def register_prop_getter(module: str):
+    """
+    A decorator to register a module by their sys.modules handle with a builder function.
+    """
+
+    def function(wrapped: Callable[[Type], Type[DataFramePropGetter]]):
+        """
+        A builder function that takes in a (ModuleType) -> Type[DataFramePropGetter]
+        and register it to pygwalker so that pygwalker recognizes the type.
+        """
+
+        # Using a () -> Type[DataFramePropGetter] s.t. it evaluates lazily.
+        __registered_modules[module] = lambda: wrapped(importlib.import_module(module))
+        return wrapped
+
+    return function
+
+class DataFramePropGetter(Generic[DataFrame, Series]):
     """DataFrame property getter"""
     Series = TypeVar("Series")
 
-    @classmethod
+    @abstractclassmethod
     def infer_semantic(cls, df: DataFrame, **kwargs):
         raise NotImplementedError
 
-    @classmethod
+    @abstractclassmethod
     def infer_analytic(cls, df: DataFrame, **kwargs):
         raise NotImplementedError
 
-    @classmethod
+    @abstractclassmethod
     def to_records(cls, df: DataFrame, **kwargs) -> List[Dict[str, Any]]:
         """Convert DataFrame to a list of records"""
         raise NotImplementedError
 
-    @classmethod
+    @abstractclassmethod
     def to_matrix(cls, df: DataFrame, **kwargs) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    @classmethod
+    @abstractclassmethod
     def escape_fname(cls, df: DataFrame, **kwargs) -> DataFrame:
         """Encode fname to prefent special characters in field name to cause errors"""
         raise NotImplementedError
@@ -108,7 +155,7 @@ class DataFramePropGetter(Generic[DataFrame]):
             for i, col in enumerate(df.columns)
         ]
 
-    @classmethod
+    @abstractclassmethod
     def limited_sample(cls, df: DataFrame) -> DataFrame:
         """Return the max sample that can be sent to GraphicWalker"""
         raise NotImplementedError
@@ -138,22 +185,13 @@ class DataFramePropGetter(Generic[DataFrame]):
         """Get safe field name from series."""
         raise NotImplementedError
 
+@register_prop_getter('pandas')
+@register_prop_getter('modin.pandas')
+def _build_pandas_prop_getter(pandas: ModuleType) -> Type[DataFramePropGetter]:
+    DataFrame = pandas.DataFrame
+    Series = pandas.Series
 
-class PandasDataFramePropGetter(DataFramePropGetter[DataFrame]):
-    pass
-
-
-class PolarsDataFramePropGetter(DataFramePropGetter[DataFrame]):
-    pass
-
-
-__classname2method = {}
-__supported_modules = ['pandas', 'polars', 'modin']
-
-
-def _build_pandas_prop_getter(pd: ModuleType):
-
-    class PandasDataFramePropGetter(DataFramePropGetter[pd.DataFrame]):
+    class PandasDataFramePropGetter(DataFramePropGetter[DataFrame, Series]):
         @classmethod
         def limited_sample(cls, df: DataFrame) -> DataFrame:
             if len(df)*2 > BYTE_LIMIT:
@@ -161,7 +199,7 @@ def _build_pandas_prop_getter(pd: ModuleType):
             return df
 
         @classmethod
-        def infer_semantic(cls, s: pd.Series):
+        def infer_semantic(cls, s: Series):
             v_cnt = len(s.value_counts())
             kind = s.dtype.kind
             return 'quantitative' if (kind in 'fcmiu' and v_cnt > 16) else \
@@ -170,44 +208,44 @@ def _build_pandas_prop_getter(pd: ModuleType):
                 'ordinal'
 
         @classmethod
-        def infer_analytic(cls, s: pd.Series):
+        def infer_analytic(cls, s: Series):
             kind = s.dtype.kind
             return 'measure' if \
                 kind in 'fcm' or (kind in 'iu' and len(s.value_counts()) > 16) \
                     else 'dimension'
 
         @classmethod
-        def series(cls, df: pd.DataFrame, i: int, col: str):
+        def series(cls, df: DataFrame, i: int, col: str):
             return df.iloc[:, i]
 
         @classmethod
-        def to_records(cls, df: pd.DataFrame):
+        def to_records(cls, df: DataFrame):
             df = df.replace({float('nan'): None})
             return df.to_dict(orient='records')
 
         @classmethod
-        def to_matrix(cls, df: pd.DataFrame, **kwargs) -> List[List[Any]]:
+        def to_matrix(cls, df: DataFrame, **kwargs) -> List[List[Any]]:
             df = df.replace({float('nan'): None})
             return df.to_dict(orient='tight')
 
         @classmethod
-        def escape_fname(cls, df: pd.DataFrame, **kwargs):
+        def escape_fname(cls, df: DataFrame, **kwargs):
             df = df.reset_index()
             df.columns = [f"{col}_{i}" for i, col in enumerate(df.columns)]
             df = df.rename(fname_encode, axis='columns')
             return df
 
         @classmethod
-        def decode_fname(cls, s: pd.Series, **kwargs):
+        def decode_fname(cls, s: Series, **kwargs):
             fname = fname_decode(s.name)
             fname = json.dumps(fname, ensure_ascii=False)[1:-1]
             return fname
 
     return PandasDataFramePropGetter
 
-
+@register_prop_getter('polars')
 def _build_polars_prop_getter(pl: ModuleType):
-    class PolarsDataFramePropGetter(DataFramePropGetter[pl.DataFrame]):
+    class PolarsDataFramePropGetter(DataFramePropGetter[pl.DataFrame, pl.Series]):
         Series = pl.Series
         @classmethod
         def limited_sample(cls, df: DataFrame) -> DataFrame:
@@ -255,22 +293,22 @@ def _build_polars_prop_getter(pl: ModuleType):
 
     return PolarsDataFramePropGetter
 
+__classname2method: Dict[str, Type[DataFramePropGetter]] = {}
+__registered_modules: Dict[str, Callable[[], Type[DataFramePropGetter]]] = {}
 
-def get_prop_getter(df: DataFrame) -> DataFramePropGetter:
+    
+def get_prop_getter(df: DataFrame) -> Type[DataFramePropGetter]:
     if type(df) in __classname2method:
         return __classname2method[type(df)]
 
-    if 'pandas' in sys.modules:
-        import pandas as pd
-        if isinstance(df, pd.DataFrame):
-            __classname2method[pd.DataFrame] = _build_pandas_prop_getter(pd)
-            return __classname2method[pd.DataFrame]
+    for module in __registered_modules.keys():
+        if module in sys.modules:
+            imported = importlib.import_module(module)
+            DataFrame = getattr(imported, 'DataFrame')
+            if isinstance(df, DataFrame):
+                __classname2method[DataFrame] = __registered_modules[module]()
+                return __classname2method[DataFrame]
 
-    if 'polars' in sys.modules:   
-        import polars as pl
-        if isinstance(df, pl.DataFrame):
-            __classname2method[pl.DataFrame] = _build_polars_prop_getter(pl)
-            return __classname2method[pl.DataFrame]
     return DataFramePropGetter
 
 
