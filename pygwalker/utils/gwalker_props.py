@@ -78,7 +78,7 @@ def register_prop_getter(module: str):
     A decorator to register a module by their sys.modules handle with a builder function.
     """
 
-    def function(wrapped: Callable[[Type], Type[DataFramePropGetter]]):
+    def function(wrapped: Callable[[ModuleType], Type[DataFramePropGetter]]):
         """
         A builder function that takes in a (ModuleType) -> Type[DataFramePropGetter]
         and register it to pygwalker so that pygwalker recognizes the type.
@@ -132,7 +132,7 @@ class DataFramePropGetter(Generic[DataFrame, Series]):
         if field_specs is None:
             field_specs = {}
 
-        s: cls.Series = cls.series(df, i, col)
+        s: Series = cls.series(df, i, col)
         orig_fname = cls.decode_fname(s)
         field_spec = field_specs.get(orig_fname, default_field_spec)
         semantic_type = cls.infer_semantic(s) if field_spec.semanticType == '?' else field_spec.semanticType
@@ -187,19 +187,16 @@ class DataFramePropGetter(Generic[DataFrame, Series]):
 
 @register_prop_getter('pandas')
 @register_prop_getter('modin.pandas')
-def _build_pandas_prop_getter(pandas: ModuleType) -> Type[DataFramePropGetter]:
-    DataFrame = pandas.DataFrame
-    Series = pandas.Series
-
-    class PandasDataFramePropGetter(DataFramePropGetter[DataFrame, Series]):
+def _build_pandas_prop_getter(pd: ModuleType) -> Type[DataFramePropGetter]:
+    class PandasDataFramePropGetter(DataFramePropGetter[pd.DataFrame, pd.Series]):
         @classmethod
-        def limited_sample(cls, df: DataFrame) -> DataFrame:
+        def limited_sample(cls, df: pd.DataFrame) -> pd.DataFrame:
             if len(df)*2 > BYTE_LIMIT:
                 df = df.iloc[:BYTE_LIMIT//2]
             return df
 
         @classmethod
-        def infer_semantic(cls, s: Series):
+        def infer_semantic(cls, s: pd.Series):
             v_cnt = len(s.value_counts())
             kind = s.dtype.kind
             return 'quantitative' if (kind in 'fcmiu' and v_cnt > 16) else \
@@ -208,35 +205,35 @@ def _build_pandas_prop_getter(pandas: ModuleType) -> Type[DataFramePropGetter]:
                 'ordinal'
 
         @classmethod
-        def infer_analytic(cls, s: Series):
+        def infer_analytic(cls, s: pd.Series):
             kind = s.dtype.kind
             return 'measure' if \
                 kind in 'fcm' or (kind in 'iu' and len(s.value_counts()) > 16) \
                     else 'dimension'
 
         @classmethod
-        def series(cls, df: DataFrame, i: int, col: str):
+        def series(cls, df: pd.DataFrame, i: int, col: str):
             return df.iloc[:, i]
 
         @classmethod
-        def to_records(cls, df: DataFrame):
+        def to_records(cls, df: pd.DataFrame):
             df = df.replace({float('nan'): None})
             return df.to_dict(orient='records')
 
         @classmethod
-        def to_matrix(cls, df: DataFrame, **kwargs) -> List[List[Any]]:
+        def to_matrix(cls, df: pd.DataFrame, **kwargs) -> List[List[Any]]:
             df = df.replace({float('nan'): None})
             return df.to_dict(orient='tight')
 
         @classmethod
-        def escape_fname(cls, df: DataFrame, **kwargs):
+        def escape_fname(cls, df: pd.DataFrame, **kwargs):
             df = df.reset_index()
             df.columns = [f"{col}_{i}" for i, col in enumerate(df.columns)]
             df = df.rename(fname_encode, axis='columns')
             return df
 
         @classmethod
-        def decode_fname(cls, s: Series, **kwargs):
+        def decode_fname(cls, s: pd.Series, **kwargs):
             fname = fname_decode(s.name)
             fname = json.dumps(fname, ensure_ascii=False)[1:-1]
             return fname
@@ -246,9 +243,8 @@ def _build_pandas_prop_getter(pandas: ModuleType) -> Type[DataFramePropGetter]:
 @register_prop_getter('polars')
 def _build_polars_prop_getter(pl: ModuleType):
     class PolarsDataFramePropGetter(DataFramePropGetter[pl.DataFrame, pl.Series]):
-        Series = pl.Series
         @classmethod
-        def limited_sample(cls, df: DataFrame) -> DataFrame:
+        def limited_sample(cls, df: pl.DataFrame) -> pl.DataFrame:
             if len(df)*2 > BYTE_LIMIT:
                 df = df.head(BYTE_LIMIT//2)
             return df
